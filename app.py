@@ -9,7 +9,11 @@ from groq import Groq
 from gtts import gTTS
 import streamlit as st
 from utils import extract_text
-import speech_recognition as sr
+try:
+    import speech_recognition as sr
+    VOICE_ENABLED = True
+except ImportError:
+    VOICE_ENABLED = False
 import uuid
 
 load_dotenv()
@@ -591,13 +595,16 @@ for msg in st.session_state.messages:
 # Voice input button
 col_voice, col_input = st.columns([1, 5])
 with col_voice:
-    if st.button(f"🎤", help=L["voice_input"], use_container_width=True):
-        with st.spinner(f"🎤 {L['voice_input']}..."):
-            voice_text = voice_to_text(lang)
-            if voice_text:
-                st.session_state.pending_question = voice_text
-            else:
-                st.warning("Could not hear anything. Please try again.")
+    if VOICE_ENABLED:
+        if st.button(f"🎤", help=L["voice_input"], use_container_width=True):
+            with st.spinner(f"🎤 {L['voice_input']}..."):
+                voice_text = voice_to_text(lang)
+                if voice_text:
+                    st.session_state.pending_question = voice_text
+                else:
+                    st.warning("Could not hear anything. Please try again.")
+    else:
+        st.caption("🎤 Voice N/A")
 
 # Text input
 question = st.chat_input(L["chat_placeholder"])
