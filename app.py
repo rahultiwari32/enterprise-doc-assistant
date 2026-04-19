@@ -10,10 +10,11 @@ from gtts import gTTS
 import streamlit as st
 from utils import extract_text
 import speech_recognition as sr
+import uuid
 
 load_dotenv()
 client = Groq(api_key=os.getenv("GROQ_API_KEY"))
-
+MAX_FILE_SIZE_MB = 10
 # --- Language Config ---
 LANG = {
     "en": {
@@ -196,26 +197,60 @@ def get_embeddings():
         model_name="sentence-transformers/all-MiniLM-L6-v2"
     )
 
+dMAX_FILE_SIZE_MB = 10
+
 def index_document(uploaded_file):
-    ext = uploaded_file.name.split(".")[-1].lower()
-    with tempfile.NamedTemporaryFile(delete=False, suffix=f".{ext}") as f:
-        f.write(uploaded_file.read())
-        tmp_path = f.name
-    chunks, metadatas = extract_text(tmp_path, ext)
-    if not chunks:
+    # File size check
+    file_size_mb = uploaded_file.size / (1024 * 1024)
+    if file_size_mb > MAX_FILE_SIZE_MB:
+        st.error(f"❌ File too large! Maximum size is {MAX_FILE_SIZE_MB}MB. Your file is {file_size_mb:.1f}MB.")
         return None, 0, 0
-    splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
-    final_chunks, final_meta = [], []
-    for chunk, meta in zip(chunks, metadatas):
-        splits = splitter.split_text(chunk)
-        for s in splits:
-            final_chunks.append(s)
-            final_meta.append(meta)
-    embeddings = get_embeddings()
-    vs = FAISS.from_texts(final_chunks, embeddings, metadatas=final_meta)
-    vs.save_local("faiss_index")
-    os.unlink(tmp_path)
-    return vs, len(final_chunks), len(chunks)
+
+    ext = uploaded_file.name.split(".")[-1].lower()
+
+    # Supported format check
+    supported = ["pdf", "docx", "doc", "xlsx", "xls", "png", "jpg", "jpeg"]
+    if ext not in supported:
+        st.error(f"❌ Unsupported file type: .{ext}. Please upload PDF, Word, Excel or Image.")
+        return None, 0, 0
+
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=f".{ext}") as f:
+            f.write(uploaded_file.read())
+            tmp_path = f.name
+
+        chunks, metadatas = extract_text(tmp_path, ext)
+
+        if not chunks:
+            st.error("❌ Could not extract text from this file. Please try another document.")
+            return None, 0, 0
+
+        splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
+        final_chunks, final_meta = [], []
+        for chunk, meta in zip(chunks, metadatas):
+            splits = splitter.split_text(chunk)
+            for s in splits:
+                final_chunks.append(s)
+                final_meta.append(meta)
+
+        embeddings = get_embeddings()
+
+        # Session-based vector store — unique per user session
+        session_id = st.session_state.get("session_id", "default")
+        index_path = f"faiss_index_{session_id}"
+        vs = FAISS.from_texts(final_chunks, embeddings, metadatas=final_meta)
+        vs.save_local(index_path)
+        st.session_state.index_path = index_path
+
+        return vs, len(final_chunks), len(chunks)
+
+    except Exception as e:
+        st.error(f"❌ Error processing document: {str(e)}")
+        return None, 0, 0
+
+    finally:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
 
 def ask_groq(question, context, lang="en"):
     lang_instruction = "Respond in Hindi." if lang == "hi" else "Respond in English."
@@ -230,13 +265,56 @@ Context:
 Question: {question}
 
 Answer:"""
-    response = client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.2
-    )
-    return response.choices[0].message.content
+    try:
+        response = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.2
+        )
+        return response.choices[0].message.content
+    except Exception as e:
+        if "rate_limit" in str(e).lower():
+            return "⚠️ Too many requests right now. Please wait a moment and try again."
+        elif "invalid_api_key" in str(e).lower():
+            return "⚠️ API key issue. Please contact the administrator."
+        else:
+            return f"⚠️ Something went wrong. Please try again."
+def extract_gst_details(context, lang="en"):
+    lang_instruction = "Respond in Hindi." if lang == "hi" else "Respond in English."
+    prompt = f"""You are a GST invoice analyzer for Indian businesses.
+Extract the following details from the invoice content below.
+{lang_instruction}
+Return ONLY these fields, if not found write "Not found":
 
+- Invoice Number
+- Invoice Date
+- Seller Name
+- Seller GSTIN
+- Buyer Name  
+- Buyer GSTIN
+- Place of Supply
+- HSN/SAC Code
+- Taxable Amount
+- CGST Amount
+- SGST Amount
+- IGST Amount
+- Total Tax
+- Total Amount (with tax)
+- Payment Status
+
+Invoice Content:
+{context}"""
+
+    try:
+        response = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.1
+        )
+        return response.choices[0].message.content
+    except Exception:
+        return "⚠️ Could not extract GST details. Please try again."
+    
 def get_suggestions(context, lang="en"):
     lang_instruction = "Generate questions in Hindi." if lang == "hi" else "Generate questions in English."
     prompt = f"""Based on this document content, suggest 3 short, useful questions a user might ask.
@@ -286,6 +364,8 @@ def autoplay_audio(file_path):
     </audio>""", unsafe_allow_html=True)
 
 # --- SESSION STATE ---
+if "session_id" not in st.session_state:
+    st.session_state.session_id = str(uuid.uuid4())[:8]
 if "messages" not in st.session_state:
     st.session_state.messages = []
 if "lang" not in st.session_state:
@@ -460,6 +540,26 @@ if not st.session_state.suggestions and "vector_store" in st.session_state:
         docs = st.session_state.vector_store.similarity_search("main topic summary", k=2)
         context = " ".join([d.page_content for d in docs])
         st.session_state.suggestions = get_suggestions(context, lang)
+
+# GST Invoice Reader Button
+if st.button("🧾 GST Reader", use_container_width=True):
+    with st.spinner("Extracting GST details..."):
+        try:
+            docs = st.session_state.vector_store.similarity_search(
+                "invoice GSTIN amount tax total seller buyer", k=5
+            )
+            context = "\n\n".join([d.page_content for d in docs])
+            gst_details = extract_gst_details(context, lang)
+            st.session_state.gst_result = gst_details
+        except Exception as e:
+            st.session_state.gst_result = f"Error: {str(e)}"
+
+if "gst_result" in st.session_state:
+    st.markdown("### 🧾 GST Invoice Details")
+    st.markdown(st.session_state.gst_result)
+    if st.button("Clear GST Result"):
+        del st.session_state.gst_result
+        st.rerun()
 
 if st.session_state.suggestions:
     st.markdown(f"**💡 {L['suggest']}:**")
